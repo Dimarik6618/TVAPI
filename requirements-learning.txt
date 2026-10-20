@@ -1,0 +1,5 @@
+# Local frozen X-CLIP features and annotation training.
+torch>=2.4,<3
+transformers==4.56.2
+safetensors>=0.4.3,<1
+pillow>=10,<13

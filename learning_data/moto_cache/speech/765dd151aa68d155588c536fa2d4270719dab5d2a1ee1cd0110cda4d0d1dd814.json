@@ -1,0 +1,335 @@
+{
+  "complete": true,
+  "spec": {
+    "version": 1,
+    "model": "base",
+    "vad": true,
+    "words": true
+  },
+  "segments": [
+    {
+      "start": 13.68,
+      "end": 14.28,
+      "text": "Стоит.",
+      "words": [
+        {
+          "start": 13.68,
+          "end": 14.28,
+          "text": " Стоит.",
+          "probability": 0.086
+        }
+      ]
+    },
+    {
+      "start": 27.23,
+      "end": 29.01,
+      "text": "Чего думаете, прям чища будет?",
+      "words": [
+        {
+          "start": 27.23,
+          "end": 27.85,
+          "text": " Чего",
+          "probability": 0.222
+        },
+        {
+          "start": 27.85,
+          "end": 28.19,
+          "text": " думаете,",
+          "probability": 0.7
+        },
+        {
+          "start": 28.29,
+          "end": 28.41,
+          "text": " прям",
+          "probability": 0.29
+        },
+        {
+          "start": 28.41,
+          "end": 28.79,
+          "text": " чища",
+          "probability": 0.681
+        },
+        {
+          "start": 28.79,
+          "end": 29.01,
+          "text": " будет?",
+          "probability": 0.626
+        }
+      ]
+    },
+    {
+      "start": 30.05,
+      "end": 30.85,
+      "text": "Где они сомакают?",
+      "words": [
+        {
+          "start": 30.05,
+          "end": 30.23,
+          "text": " Где",
+          "probability": 0.003
+        },
+        {
+          "start": 30.23,
+          "end": 30.35,
+          "text": " они",
+          "probability": 0.293
+        },
+        {
+          "start": 30.35,
+          "end": 30.85,
+          "text": " сомакают?",
+          "probability": 0.433
+        }
+      ]
+    },
+    {
+      "start": 33.38,
+      "end": 34.32,
+      "text": "Не знаю, мы знаем.",
+      "words": [
+        {
+          "start": 33.38,
+          "end": 33.66,
+          "text": " Не",
+          "probability": 0.102
+        },
+        {
+          "start": 33.66,
+          "end": 33.82,
+          "text": " знаю,",
+          "probability": 0.984
+        },
+        {
+          "start": 34.02,
+          "end": 34.1,
+          "text": " мы",
+          "probability": 0.542
+        },
+        {
+          "start": 34.1,
+          "end": 34.32,
+          "text": " знаем.",
+          "probability": 0.971
+        }
+      ]
+    },
+    {
+      "start": 35.24,
+      "end": 35.42,
+      "text": "Что?",
+      "words": [
+        {
+          "start": 35.24,
+          "end": 35.42,
+          "text": " Что?",
+          "probability": 0.403
+        }
+      ]
+    },
+    {
+      "start": 35.98,
+      "end": 36.98,
+      "text": "Я не промокаюсь.",
+      "words": [
+        {
+          "start": 35.98,
+          "end": 36.36,
+          "text": " Я",
+          "probability": 0.059
+        },
+        {
+          "start": 36.36,
+          "end": 36.54,
+          "text": " не",
+          "probability": 0.613
+        },
+        {
+          "start": 36.54,
+          "end": 36.98,
+          "text": " промокаюсь.",
+          "probability": 0.819
+        }
+      ]
+    },
+    {
+      "start": 38.34,
+      "end": 39.94,
+      "text": "Промокаюсь? Я уже промокаюсь.",
+      "words": [
+        {
+          "start": 38.34,
+          "end": 38.96,
+          "text": " Промокаюсь?",
+          "probability": 0.768
+        },
+        {
+          "start": 39.36,
+          "end": 39.36,
+          "text": " Я",
+          "probability": 0.089
+        },
+        {
+          "start": 39.36,
+          "end": 39.52,
+          "text": " уже",
+          "probability": 0.978
+        },
+        {
+          "start": 39.52,
+          "end": 39.94,
+          "text": " промокаюсь.",
+          "probability": 0.899
+        }
+      ]
+    },
+    {
+      "start": 40.3,
+      "end": 40.72,
+      "text": "Промокаюсь?",
+      "words": [
+        {
+          "start": 40.3,
+          "end": 40.72,
+          "text": " Промокаюсь?",
+          "probability": 0.741
+        }
+      ]
+    },
+    {
+      "start": 40.92,
+      "end": 41.32,
+      "text": "Да-да.",
+      "words": [
+        {
+          "start": 40.92,
+          "end": 41.14,
+          "text": " Да",
+          "probability": 0.796
+        },
+        {
+          "start": 41.14,
+          "end": 41.32,
+          "text": "-да.",
+          "probability": 0.711
+        }
+      ]
+    },
+    {
+      "start": 42.08,
+      "end": 43.08,
+      "text": "А че они сомакают?",
+      "words": [
+        {
+          "start": 42.08,
+          "end": 42.28,
+          "text": " А",
+          "probability": 0.339
+        },
+        {
+          "start": 42.28,
+          "end": 42.44,
+          "text": " че",
+          "probability": 0.34
+        },
+        {
+          "start": 42.44,
+          "end": 42.54,
+          "text": " они",
+          "probability": 0.272
+        },
+        {
+          "start": 42.54,
+          "end": 43.08,
+          "text": " сомакают?",
+          "probability": 0.559
+        }
+      ]
+    },
+    {
+      "start": 43.96,
+      "end": 46.08,
+      "text": "Ну они у тебя изнутри уже промокли.",
+      "words": [
+        {
+          "start": 43.96,
+          "end": 44.58,
+          "text": " Ну",
+          "probability": 0.218
+        },
+        {
+          "start": 44.58,
+          "end": 44.76,
+          "text": " они",
+          "probability": 0.356
+        },
+        {
+          "start": 44.76,
+          "end": 44.8,
+          "text": " у",
+          "probability": 0.833
+        },
+        {
+          "start": 44.8,
+          "end": 44.92,
+          "text": " тебя",
+          "probability": 0.829
+        },
+        {
+          "start": 44.92,
+          "end": 45.32,
+          "text": " изнутри",
+          "probability": 0.706
+        },
+        {
+          "start": 45.32,
+          "end": 45.52,
+          "text": " уже",
+          "probability": 0.991
+        },
+        {
+          "start": 45.52,
+          "end": 46.08,
+          "text": " промокли.",
+          "probability": 0.962
+        }
+      ]
+    },
+    {
+      "start": 46.08,
+      "end": 50.08,
+      "text": "Мне кажется, пропускают сразу же.",
+      "words": [
+        {
+          "start": 46.08,
+          "end": 47.62,
+          "text": " Мне",
+          "probability": 0.114
+        },
+        {
+          "start": 47.62,
+          "end": 47.9,
+          "text": " кажется,",
+          "probability": 0.967
+        },
+        {
+          "start": 48.12,
+          "end": 48.72,
+          "text": " пропускают",
+          "probability": 0.937
+        },
+        {
+          "start": 48.72,
+          "end": 49.14,
+          "text": " сразу",
+          "probability": 0.912
+        },
+        {
+          "start": 49.14,
+          "end": 50.08,
+          "text": " же.",
+          "probability": 0.91
+        }
+      ]
+    }
+  ]
+}
