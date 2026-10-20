@@ -458,8 +458,10 @@ def analyze_batch(paths: list[Path], clip_length: int, count: int,
                   deduplicate: bool = True, profile: str = 'auto',
                   resume: dict | None = None, on_complete=lambda path, clips: None,
                   model_pool: dict | None = None, learning_folder: Path | None = None,
-                  source_loader=None, source_origin=None, after_complete=None, capture_memory=False):
+                  source_loader=None, source_origin=None, after_complete=None, capture_memory=False,
+                  memory_features=True):
     rows,errors,diagnostics=[],[],[]
+    performance_records = []
     options=options or Options()
     preferences=PreferenceStore(preferences_folder) if preferences_folder else None
     model=preferences.fitted() if preferences else None
@@ -473,6 +475,17 @@ def analyze_batch(paths: list[Path], clip_length: int, count: int,
     if capture_memory and learning_folder:
         from event_archive import EventArchive
         archive = EventArchive(learning_folder)
+
+    def memory_complete(path):
+        if not capture_memory:
+            return True
+        if not archive:
+            return False
+        if memory_features:
+            return archive.can_release(path)
+        saved = archive.source_for(path)
+        return bool(saved and saved.get('complete'))
+
     if learning_folder:
         try:
             learning=LearningStore(learning_folder)
@@ -492,34 +505,47 @@ def analyze_batch(paths: list[Path], clip_length: int, count: int,
     on_progress(0.,runtime.summary())
     for index,path in enumerate(paths):
         label=f'{index+1}/{len(paths)} · {path.name}'
+        file_started = time.perf_counter()
+        stage_seconds = {}
+        file_status, duration, clips = 'error', None, []
+
+        def timed(stage, operation, *args, **kwargs):
+            started = time.perf_counter()
+            try:
+                return operation(*args, **kwargs)
+            finally:
+                stage_seconds[stage] = stage_seconds.get(stage, 0.) + time.perf_counter()-started
+
         try:
             tasks.check()
             entry=(resume or {}).get(str(path.resolve()))
             if entry and entry.get('event_model','off')==selection_token:
                 valid=ProjectStore.valid_completed({'completed':{str(path.resolve()):entry}},archive)
-                if valid and (not capture_memory or (archive and archive.can_release(path))):
+                if valid and memory_complete(path):
                     clips=[Clip(**item) for item in entry['clips']]
                     rows.extend((path,clip) for clip in clips)
                     on_progress((index+1)/len(paths),label+' · восстановлено из проекта и памяти')
                     tasks.check()
                     if after_complete:after_complete(path,clips)
+                    file_status = 'restored'
                     continue
             if source_loader:
-                source_loader(path, lambda f:on_progress(index/len(paths),label+f' · загрузка {f:.0%}'))
+                timed('source_prepare',source_loader,path,lambda f:on_progress(index/len(paths),label+f' · загрузка {f:.0%}'))
             if not path.is_file():
                 raise FileNotFoundError(f'Не найден MP4: {path}. Подключите диск или выберите файл заново.')
             entry=(resume or {}).get(str(path.resolve()))
             if (entry and entry.get('fingerprint')==fingerprint(path) and entry.get('event_model','off')==selection_token
-                and (not capture_memory or (archive and archive.can_release(path)))):
+                and memory_complete(path)):
                 clips=[Clip(**item) for item in entry['clips']]
                 rows.extend((path,clip) for clip in clips)
                 on_progress((index+1)/len(paths),label+' · восстановлено из проекта')
                 tasks.check()
                 if after_complete:after_complete(path,clips)
+                file_status = 'restored'
                 continue
             proxy,warning=paired_proxy(path,ffmpeg_exe()) if use_proxies else (None,None)
             if warning:errors.append((path,warning))
-            duration,data,key=scan_video(path,ffmpeg_exe(),lambda f,stage:on_progress(
+            duration,data,key=timed('scan',scan_video,path,ffmpeg_exe(),lambda f,stage:on_progress(
                 (index+f*.45)/len(paths),f'{label} · {stage}'),proxy,cache,runtime)
             # A wider candidate pool lets thresholds/diversity filter rather than fill quotas.
             clips=choose_clips(data['motion'],data['audio'],duration,clip_length,
@@ -532,7 +558,7 @@ def analyze_batch(paths: list[Path], clip_length: int, count: int,
                     if speech is None:
                         speech = SpeechAnalyzer(ffmpeg_exe(), learning_folder or preferences_folder or path.parent, runtime)
                         pool['speech'] = speech
-                    speech_segments = speech.recognize(path, duration, lambda f:on_progress(
+                    speech_segments = timed('speech',speech.recognize,path,duration,lambda f:on_progress(
                         (index+.45+.13*f)/len(paths),label+' · распознавание речи'))
                     for item in speech_candidates(speech_segments, duration):
                         a,b=item['start'],item['end']
@@ -544,7 +570,7 @@ def analyze_batch(paths: list[Path], clip_length: int, count: int,
                     errors.append((path,'Речь: '+str(exc)))
             if selector:
                 try:
-                    clips=selector.discover(path,duration,data,clips,clip_length,count,
+                    clips=timed('trained_discovery',selector.discover,path,duration,data,clips,clip_length,count,
                         lambda f:on_progress((index+.58+.15*f)/len(paths),label+' · поиск обученных событий'))
                 except Exception as exc:
                     errors.append((path,f'Обученный сюжет: {exc}; используется обычный отбор.'))
@@ -585,11 +611,11 @@ def analyze_batch(paths: list[Path], clip_length: int, count: int,
                             if not old_key.startswith(('trained-event:','memory-features:','speech')):pool.pop(old_key)
                         import gc
                         gc.collect()
-                        advanced=AdvancedAnalyzer(effective,ffmpeg_exe(),lambda message:on_progress(
+                        advanced=timed('model_initialization',AdvancedAnalyzer,effective,ffmpeg_exe(),lambda message:on_progress(
                             (index+.73)/len(paths),message),runtime=runtime)
                         pool[pool_key]=advanced
                     try:
-                        advanced.enrich(path,pending,lambda stage,f:on_progress(
+                        timed('objects_sound_meaning',advanced.enrich,path,pending,lambda stage,f:on_progress(
                             (index+.73+.14*f)/len(paths),stage),frame_source=proxy)
                         errors.extend((path,w) for w in advanced.warnings)
                         diagnostics.extend(advanced.diagnostics)
@@ -612,7 +638,7 @@ def analyze_batch(paths: list[Path], clip_length: int, count: int,
             if selector and clips:
                 original=[Clip(**asdict(clip)) for clip in clips]
                 try:
-                    selector.enrich(path,clips,lambda f:on_progress((index+.87+.05*f)/len(paths),
+                    timed('trained_scoring',selector.enrich,path,clips,lambda f:on_progress((index+.87+.05*f)/len(paths),
                                                                     label+' · оценка обученного сюжета'))
                 except Exception as exc:
                     clips=original
@@ -625,9 +651,16 @@ def analyze_batch(paths: list[Path], clip_length: int, count: int,
                     clip.reason+=' · ваш выбор'
             if capture_memory and learning_folder:
                 from event_memory import remember
-                warning = remember(path,duration,data,clips,learning_folder,runtime,pool,selector,
+                memory_fraction = 0.
+                def memory_progress(fraction):
+                    nonlocal memory_fraction
+                    memory_fraction = fraction
+                    on_progress((index+.92+.079*fraction)/len(paths),label+' · память событий')
+                def memory_status(text):
+                    on_progress((index+.92+.079*memory_fraction)/len(paths),label+' · '+text)
+                warning = timed('event_memory',remember,path,duration,data,clips,learning_folder,runtime,pool,selector,
                     source_origin(path) if source_origin else None,
-                    lambda f:on_progress((index+.92+.079*f)/len(paths),label+' · память событий'))
+                    memory_progress,freeze_features=memory_features,on_status=memory_status)
                 if warning:
                     errors.append((path,'Анализ сохранён, но признаки для обучения не готовы: '+warning))
             clips=select_best(clips,count,threshold,deduplicate,[c for _,c in rows])
@@ -637,9 +670,25 @@ def analyze_batch(paths: list[Path], clip_length: int, count: int,
             tasks.check()
             if after_complete:
                 after_complete(path,clips)
+            file_status = 'complete'
             on_progress((index+1)/len(paths),label+f' · найдено {len(clips)}')
-        except tasks.Cancelled:break
+        except tasks.Cancelled:
+            file_status = 'stopped'
+            break
         except Exception as exc:errors.append((path,str(exc)))
+        finally:
+            performance_records.append({
+                'source':path.name,'duration_seconds':duration,'status':file_status,
+                'total_seconds':round(time.perf_counter()-file_started,3),
+                'stage_seconds':{k:round(v,3) for k,v in stage_seconds.items()},
+                'candidates_returned':len(clips)})
+            if preferences_folder:
+                try:
+                    atomic_json(Path(preferences_folder)/'moto_performance.json',{
+                        'version':1,'profile':profile,'memory_features':memory_features,
+                        'options':asdict(options),'files':performance_records})
+                except (OSError,ValueError) as exc:
+                    errors.append((path,'Отчёт времени не сохранён: '+str(exc)))
     if diagnostics and preferences_folder:
         log_path=Path(preferences_folder)/'moto_analysis.log'
         try:
@@ -653,7 +702,8 @@ def analyze_batch(paths: list[Path], clip_length: int, count: int,
 
 
 def reanalyze_clip(source, clip, options, folder, use_proxies=True, profile='auto',
-                   on_progress=lambda f,s:None, model_pool=None, learning_folder=None):
+                   on_progress=lambda f,s:None, model_pool=None, learning_folder=None,
+                   memory_features=True):
     cache=CacheStore(folder);runtime=Runtime.detect(profile)
     proxy,_=paired_proxy(source,ffmpeg_exe()) if use_proxies else (None,None)
     duration,data,key=scan_video(source,ffmpeg_exe(),on_progress,proxy,cache,runtime)
@@ -705,7 +755,9 @@ def reanalyze_clip(source, clip, options, folder, use_proxies=True, profile='aut
     if learning_folder:
         from event_memory import remember
         warning=remember(source,duration,data,[clip],learning_folder,runtime,pool,selector,
-                         on_progress=lambda f:on_progress(f,'Сохранение признаков изменённого отрезка'))
+                         on_progress=lambda f:on_progress(f,'Память изменённого отрезка'),
+                         freeze_features=memory_features,
+                         on_status=lambda text:on_progress(0.,text))
         if warning:warnings.append('Память событий: '+warning)
     return clip,warnings
 
@@ -955,6 +1007,7 @@ class App:
         self.use_proxies = tk.BooleanVar(value=True)
         self.threshold = tk.DoubleVar(value=.22)
         self.deduplicate = tk.BooleanVar(value=True)
+        self.memory_features = tk.BooleanVar(value=True)
         self.performance = tk.StringVar(value='Авто')
         self.framing = tk.StringVar(value='full')
         self.color_mode = tk.StringVar(value='Без коррекции')
@@ -1283,7 +1336,8 @@ class App:
                 def work():
                     result,warnings=reanalyze_clip(source,draft,Options(**cfg.get('options',{})),folder,
                         cfg.get('use_proxies',True),cfg.get('profile','auto'),
-                        lambda f,s:self.events.put(('progress',(f,s))),self.model_pool,self.learning_folder)
+                        lambda f,s:self.events.put(('progress',(f,s))),self.model_pool,self.learning_folder,
+                        memory_features=cfg.get('memory_features',True))
                     return ('edited',(index,result,warnings,open_video))
                 self.background(work)
             else:
@@ -1479,7 +1533,11 @@ class App:
         tk.Checkbutton(frame,text='Убирать похожие фрагменты',variable=self.deduplicate,bg=self.CARD,fg=self.PALE,selectcolor='#173047').grid(row=11,column=0,columnspan=2,sticky='w')
         self.label(frame,'Производительность').grid(row=12,column=0,sticky='w',pady=8)
         ttk.Combobox(frame,textvariable=self.performance,values=['Авто','Экономный','Максимальная скорость'],state='readonly',width=22,style='Neon.TCombobox').grid(row=12,column=1,sticky='w')
-        self.label(frame,'Число фрагментов — максимум; слабые кандидаты пропускаются.').grid(row=13,column=0,columnspan=2,sticky='w',pady=6)
+        tk.Checkbutton(frame,text='Признаки для обучения без оригиналов (дольше)',
+                       variable=self.memory_features,bg=self.CARD,fg=self.PALE,
+                       selectcolor='#173047').grid(row=13,column=0,columnspan=2,sticky='w')
+        self.label(frame,'Без признаков сохраняются таймкоды и оценки; исходники нужны для обучения.').grid(row=14,column=0,columnspan=2,sticky='w')
+        self.label(frame,'Число фрагментов — максимум; слабые кандидаты пропускаются.').grid(row=15,column=0,columnspan=2,sticky='w',pady=6)
         def apply():
             try:
                 length = 0 if self.auto_length.get() else self.length.get()
@@ -1495,7 +1553,7 @@ class App:
             window.destroy()
             self.start_analyze(length, count, flags, use_proxies)
         self.button(frame, '✦ НАЧАТЬ АНАЛИЗ', apply, self.CYAN, True).grid(
-            row=14, column=0, columnspan=2, sticky='ew', pady=(18, 0))
+            row=16, column=0, columnspan=2, sticky='ew', pady=(18, 0))
 
     def profile_key(self):
         return {'Авто':'auto','Экономный':'economy','Максимальная скорость':'fast'}.get(self.performance.get(),'auto')
@@ -1543,6 +1601,7 @@ class App:
             length=cfg.get('length',0);self.auto_length.set(length==0);self.length.set(length or 30)
             self.count.set(cfg.get('count',5));self.use_proxies.set(cfg.get('use_proxies',True))
             self.threshold.set(cfg.get('threshold',.22));self.deduplicate.set(cfg.get('deduplicate',True))
+            self.memory_features.set(cfg.get('memory_features',True))
             self.performance.set({'auto':'Авто','economy':'Экономный','fast':'Максимальная скорость'}.get(cfg.get('profile'),'Авто'))
             for key,value in cfg.get('options',{}).items():self.ai_flags[key].set(value)
             self.sources=[Path(r['source']) for r in state.get('rows',[])]
@@ -1593,12 +1652,15 @@ class App:
         profile=self.profile_key()
         def work():
             runtime=Runtime.detect(profile)
+            details = []
             try:
                 import torch
+                from hardware import torch_details
                 runtime.select_torch(torch)
+                details = torch_details(torch)
             except ImportError:runtime.notes.append('Пакеты ИИ не установлены.')
             runtime.select_encoder(ffmpeg_exe())
-            return ('hardware',runtime.summary()+'\nGPU: '+runtime.gpu+'\n'+'\n'.join(runtime.notes))
+            return ('hardware',runtime.summary()+'\nGPU: '+runtime.gpu+'\n'+'\n'.join(details+runtime.notes))
         self.background(work)
 
     def resume_project(self):
@@ -1607,6 +1669,7 @@ class App:
         cfg=self.analysis_settings
         self.threshold.set(cfg.get('threshold',.22))
         self.deduplicate.set(cfg.get('deduplicate',True))
+        self.memory_features.set(cfg.get('memory_features',True))
         self.performance.set({'auto':'Авто','economy':'Экономный','fast':'Максимальная скорость'}.get(cfg.get('profile'),'Авто'))
         self.start_analyze(cfg['length'],cfg['count'],Options(**cfg['options']),cfg['use_proxies'],resume=True)
 
@@ -1616,7 +1679,8 @@ class App:
         folder=Path(self.folder.get());profile=self.profile_key()
         self.analysis_settings={'length':length,'count':count,'options':asdict(flags),
             'use_proxies':use_proxies,'threshold':self.threshold.get(),
-            'deduplicate':self.deduplicate.get(),'profile':profile}
+            'deduplicate':self.deduplicate.get(),'profile':profile,
+            'memory_features':self.memory_features.get()}
         try:
             token=LearningStore(self.learning_folder).token()
         except (OSError,ValueError,KeyError,TypeError):token='unavailable'
@@ -1658,7 +1722,8 @@ class App:
                 restored,complete,self.model_pool,self.learning_folder,
                 source_loader=self.drive_store.ensure,
                 source_origin=lambda p:self.drive_store.entry(p)['metadata'] if self.drive_store.entry(p) else None,
-                after_complete=lambda p,c:self.cleanup_drive_source(p),capture_memory=True)
+                after_complete=lambda p,c:self.cleanup_drive_source(p),capture_memory=True,
+                memory_features=cfg.get('memory_features',True))
             self.project_state=state
             return ('analysis',result)
         self.background(work)

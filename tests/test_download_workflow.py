@@ -128,6 +128,19 @@ class DownloadWorkflowTests(unittest.TestCase):
         self.assertTrue(self.path.exists())
         self.assertFalse(self.archive.can_release(self.path))
         self.assertTrue(self.archive.list_events())
+
+    def test_optional_frozen_features_skip_encoder_and_prevent_automatic_deletion(self):
+        with patch('event_memory.VideoFeatureExtractor',side_effect=AssertionError('must not load hidden model')):
+            rows,errors=m.analyze_batch([self.path],0,2,threshold=0,use_proxies=False,
+                preferences_folder=self.root,learning_folder=self.folder,capture_memory=True,
+                memory_features=False,source_loader=self.drive.ensure,
+                source_origin=lambda p:self.drive.entry(p)['metadata'],on_complete=self.checkpoint,
+                after_complete=lambda p,c:self.drive.release(p,self.archive))
+        self.assertFalse(errors)
+        self.assertTrue(rows)
+        self.assertTrue(self.path.is_file())
+        self.assertFalse(self.archive.can_release(self.path))
+        self.assertTrue(self.project.path.is_file())
         self.assertTrue(all(not e['feature_ready'] for e in self.archive.list_events()))
 
     def test_checkpoint_failure_keeps_source_even_with_saved_features(self):
