@@ -7,3 +7,6 @@
 /__pycache__/** export-ignore
 *.pyc export-ignore
 *.pyo export-ignore
+
+# Preserve the supplied LUT exactly, including line endings, on Windows checkouts.
+/assets/luts/*.cube binary
