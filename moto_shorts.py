@@ -309,12 +309,34 @@ def choose_clips(motion: np.ndarray, audio: np.ndarray, duration: float,
     return sorted(chosen, key=lambda item: item.start)
 
 
+def prepare_scan_scores(data):
+    """Derive ride-wide scales once per scan, retaining the original score formula.
+
+    Derived arrays live only in memory. A new scan (including a disk-cache hit)
+    prepares fresh scales; persisted caches and event timelines keep raw signals.
+    Treat returned scan arrays as immutable during an analysis pass.
+    """
+    size = max(1, math.ceil(len(data['motion']) / FPS_SAMPLE))
+    motion = np.asarray([np.mean(data['motion'][i*FPS_SAMPLE:(i+1)*FPS_SAMPLE])
+                         for i in range(size)])
+    sound = np.zeros(size)
+    sound[:min(size, len(data['audio']))] = data['audio'][:size]
+    activity = .3*normalize(motion) + .5*normalize(local_change(motion))
+    if len(data['audio']):
+        activity += .2*normalize(local_change(sound))
+    return {**data, '_score_timeline': {
+        'activity': activity,
+        'visual': normalize(data['motion']),
+        'audio': normalize(data['audio']),
+    }}
+
+
 def scan_video(path, ffmpeg, on_progress, proxy=None, cache=None, runtime=None):
     key = cache.key(path,proxy) if cache else None
     cached = cache.load_scan(key) if cache else None
     if cached:
         on_progress(.95,'Сканирование из кэша')
-        return cached[0],cached[1],key
+        return cached[0],prepare_scan_scores(cached[1]),key
     duration, has_audio = video_info(path,ffmpeg)
     runtime = runtime or Runtime.detect()
     stage = 'Сканирование LRF' if proxy else 'Сканирование движения'
@@ -326,10 +348,13 @@ def scan_video(path, ffmpeg, on_progress, proxy=None, cache=None, runtime=None):
     data = dict(motion=motion,quality=quality,audio=audio,signature=signature)
     if cache:
         cache.save_scan(key,duration,**data)
-    return duration,data,key
+    return duration,prepare_scan_scores(data),key
 
 
 def describe_clip(clip, data):
+    scales = data.get('_score_timeline')
+    if scales is None:
+        scales = prepare_scan_scores(data)['_score_timeline']
     lo,hi=int(clip.start*FPS_SAMPLE),max(1,math.ceil(clip.end*FPS_SAMPLE))
     audio=data['audio'][int(clip.start):math.ceil(clip.end)]
     quality=data['quality'][lo:hi]
@@ -338,17 +363,15 @@ def describe_clip(clip, data):
     clip.signature=(np.mean(sig,axis=0).round(4).tolist() if len(sig) else [])
     clip.signals.update(baseline=clip.score,duration=min(2.,(clip.end-clip.start)/90.),
         quality=float(np.clip(np.mean(quality)/30.,0,1)) if len(quality) else 0.,
-        visual=float(np.mean(normalize(data['motion'])[lo:hi])) if len(motion) else 0.,
-        audio=float(np.mean(normalize(data['audio'])[int(clip.start):math.ceil(clip.end)])) if len(audio) else 0.)
+        visual=float(np.mean(scales['visual'][lo:hi])) if len(motion) else 0.,
+        audio=float(np.mean(scales['audio'][int(clip.start):math.ceil(clip.end)])) if len(audio) else 0.)
 
 
 def baseline_at(data, start, end):
-    size=max(1,math.ceil(len(data['motion'])/FPS_SAMPLE))
-    motion=np.asarray([np.mean(data['motion'][i*FPS_SAMPLE:(i+1)*FPS_SAMPLE]) for i in range(size)])
-    sound=np.zeros(size)
-    sound[:min(size,len(data['audio']))]=data['audio'][:size]
-    activity=.3*normalize(motion)+.5*normalize(local_change(motion))
-    if len(data['audio']):activity+=.2*normalize(local_change(sound))
+    scales = data.get('_score_timeline')
+    if scales is None:
+        scales = prepare_scan_scores(data)['_score_timeline']
+    activity = scales['activity']
     segment=activity[int(start):max(int(start)+1,math.ceil(end))]
     return round(.65*float(np.mean(segment))+.35*float(np.max(segment)),3)
 
@@ -720,7 +743,7 @@ def export(path: Path, destination: Path, clips: list[Clip], framing: str,
     try:
         with tempfile.TemporaryDirectory(prefix='moto_grade_') as temp_folder:
             if color.mode == 'dlog':
-                shutil.copyfile(color.lut, Path(temp_folder) / 'grade.cube')
+                shutil.copyfile(color.lut_path(), Path(temp_folder) / 'grade.cube')
             for index, clip in enumerate(selected, 1):
                 tasks.check()
                 output = destination / f'{path.stem}_short_{index:02d}.mp4'
@@ -1665,13 +1688,30 @@ class App:
                             style='Neon.TCombobox', width=24,
                             values=('Без коррекции', 'Ручная настройка', 'D-Log M + LUT'))
         mode.grid(row=3, column=1, sticky='w', pady=(12, 0))
-        self.button(frame, 'LUT .CUBE', lambda: self.pick_lut(window)).grid(
+        lut_label = self.label(frame, '')
+        lut_label.configure(wraplength=380, justify='left')
+        lut_label.grid(row=5, column=0, columnspan=2, sticky='w', pady=6)
+        def show_lut():
+            name = ('Свой LUT: ' + Path(self.color_lut.get()).name if self.color_lut.get()
+                    else 'Встроенный LUT DJI Osmo Action 5 Pro → Rec.709')
+            lut_label.configure(text=name)
+        def choose_lut():
+            self.pick_lut(window)
+            show_lut()
+        def use_builtin_lut():
+            self.color_lut.set('')
+            self.color_mode.set('D-Log M + LUT')
+            show_lut()
+        show_lut()
+        self.button(frame, 'ДРУГОЙ LUT', choose_lut).grid(
             row=3, column=2, pady=(12, 0))
+        self.button(frame, 'ВСТРОЕННЫЙ DJI', use_builtin_lut).grid(
+            row=5, column=2, pady=6)
         self.label(frame, 'LUT применяйте только к съёмке D-Log M.').grid(
             row=4, column=1, columnspan=2, sticky='w')
         for row, (title, variable) in enumerate((('Яркость', self.color_brightness),
                                                   ('Контраст', self.color_contrast),
-                                                  ('Насыщенность', self.color_saturation)), 5):
+                                                  ('Насыщенность', self.color_saturation)), 6):
             self.label(frame, title).grid(row=row, column=0, sticky='w')
             tk.Scale(frame, from_=-30, to=30, orient='horizontal', length=250,
                      variable=variable, bg=self.CARD, fg=self.CYAN,
@@ -1689,7 +1729,7 @@ class App:
             window.destroy()
             self.start_export(color)
         self.button(frame, '✂ СОЗДАТЬ ШОРТСЫ', apply, self.PINK, True).grid(
-            row=8, column=0, columnspan=3, sticky='ew', pady=(14, 0))
+            row=9, column=0, columnspan=3, sticky='ew', pady=(14, 0))
 
     def pick_output(self, parent):
         folder = filedialog.askdirectory(parent=parent)
@@ -1941,7 +1981,8 @@ def main():
     parser.add_argument('--count', type=int, default=5, help='Количество фрагментов 1–20')
     parser.add_argument('--framing', choices=['full', 'crop'], default='full')
     parser.add_argument('--color', choices=['none', 'manual', 'dlog'], default='none')
-    parser.add_argument('--lut', type=Path, help='DJI Osmo Action 5 Pro .cube для D-Log M')
+    parser.add_argument('--lut', type=Path,
+                        help='Свой .cube для --color dlog; по умолчанию встроенный LUT DJI Action 5 Pro')
     parser.add_argument('--brightness', type=int, default=0, help='−30…30')
     parser.add_argument('--contrast', type=int, default=0, help='−30…30')
     parser.add_argument('--saturation', type=int, default=0, help='−30…30')

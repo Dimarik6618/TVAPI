@@ -1,8 +1,12 @@
-"""Color treatment for exported shorts, with an optional camera-specific 3D LUT."""
+"""Color treatment with a bundled Action 5 Pro LUT and optional custom LUTs."""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
+
+BUILTIN_LUT = (Path(__file__).resolve().parent / 'assets' / 'luts'
+               / 'dji_osmo_action_5_pro_dlog_m_to_rec709_v1.cube')
 
 
 @dataclass(frozen=True)
@@ -13,6 +17,10 @@ class ColorGrade:
     saturation: int = 0  # -30..30
     lut: str = ''
 
+    def lut_path(self) -> Path:
+        """An empty override selects the bundled LUT, independent of working directory."""
+        return Path(self.lut) if self.lut else BUILTIN_LUT
+
     def validate(self) -> None:
         if self.mode not in ('none', 'manual', 'dlog'):
             raise ValueError('Неизвестный режим цветокоррекции.')
@@ -20,9 +28,11 @@ class ColorGrade:
                (self.brightness, self.contrast, self.saturation)):
             raise ValueError('Ползунки цвета должны быть в пределах −30…30.')
         if self.mode == 'dlog':
-            path = Path(self.lut)
+            path = self.lut_path()
             if path.suffix.lower() != '.cube' or not path.is_file():
-                raise ValueError('Для D-Log M выберите .cube LUT для Osmo Action 5 Pro.')
+                if self.lut:
+                    raise ValueError('Не найден выбранный .cube LUT. Выберите файл или встроенный LUT DJI.')
+                raise ValueError('Не найден встроенный LUT DJI. Распакуйте папку программы целиком, включая assets.')
 
     def filters(self) -> list[str]:
         self.validate()
@@ -36,4 +46,8 @@ class ColorGrade:
         return result
 
     def manifest(self) -> dict:
-        return asdict(self)
+        result = asdict(self)
+        if self.mode == 'dlog':
+            result.update(lut_source='external' if self.lut else 'builtin',
+                          lut_name=self.lut_path().name)
+        return result
