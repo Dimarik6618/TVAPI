@@ -21,11 +21,11 @@ import numpy as np
 
 import task_control as tasks
 from project_store import atomic_json, digest, fingerprint
+from preferences import EXCLUDED_REASONS
 from video_features import FEATURE_SPEC, VideoFeatureExtractor, unit_vector
 
 MIN_PER_CLASS = 5
 MODEL_VERSION = 1
-EXCLUDED_REASONS = {'Неудачные границы', 'Повтор', 'Тряска / плохое качество'}
 
 
 def read_annotations(path):

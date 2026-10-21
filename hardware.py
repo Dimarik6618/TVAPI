@@ -31,6 +31,24 @@ def memory_info():
         return 0, 2*1024**3
 
 
+def torch_details(torch):
+    """Report the installed runtime, rather than inferring CUDA from the GPU name."""
+    cuda_version = getattr(getattr(torch, 'version', None), 'cuda', None)
+    details = [f'PyTorch: {torch.__version__}',
+               'CUDA in PyTorch: ' + (str(cuda_version) if cuda_version else 'not included')]
+    try:
+        available = torch.cuda.is_available()
+        details.append(f'CUDA available: {available}')
+        if available:
+            details.append('GPU: ' + torch.cuda.get_device_name(0))
+            capability = torch.cuda.get_device_capability(0)
+            details.append(f'GPU compute capability: {capability[0]}.{capability[1]}')
+            details.append('PyTorch GPU architectures: ' + ', '.join(torch.cuda.get_arch_list()))
+    except Exception as exc:
+        details.append('CUDA diagnostics: ' + str(exc))
+    return details
+
+
 @dataclass
 class Runtime:
     profile: str = 'auto'
@@ -43,6 +61,7 @@ class Runtime:
     encoder: str = 'libx264'
     notes: list[str] = field(default_factory=list)
     probed: bool = False
+    scan: dict = field(default_factory=dict)
 
     @classmethod
     def detect(cls, profile='auto'):

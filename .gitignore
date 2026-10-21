@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+.venvs/
+learning_data/
+moto_cache/
+shorts/
+*.part
+*.pending.mp4
+*.log
+moto_performance.json
+token.json
+client_secret*.json
+dist/

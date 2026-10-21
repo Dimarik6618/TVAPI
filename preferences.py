@@ -11,6 +11,9 @@ import numpy as np
 FEATURES = ('baseline', 'objects', 'sound', 'meaning', 'gps', 'camera',
             'duration', 'quality', 'visual', 'audio', 'speech')
 FILENAME = 'moto_preferences.json'
+# These decisions describe presentation or repetition, not a boring event.
+# Shared with the visual classifier so both learning paths interpret them alike.
+EXCLUDED_REASONS = {'Неудачные границы', 'Повтор', 'Тряска / плохое качество'}
 
 
 def feature_vector(signals: dict[str, float]) -> np.ndarray:
@@ -61,9 +64,9 @@ class PreferenceStore:
         return (round(new_start,2),round(new_end,2)) if new_end-new_start >= 3 else (start,end)
 
     def fitted(self):
-        # A duplicate or a bad cut need not make the underlying event uninteresting.
+        # Keep every decision in history, but learn interest only from story labels.
         samples = [sample for sample in self.samples.values()
-                   if sample.get('reason') not in ('Неудачные границы', 'Повтор')]
+                   if sample.get('reason') not in EXCLUDED_REASONS]
         positives = sum(bool(s.get('accepted')) for s in samples)
         negatives = len(samples) - positives
         if positives < 5 or negatives < 5:

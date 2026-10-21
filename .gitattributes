@@ -1,0 +1,12 @@
+# Runtime data already present in Git remain intact; exclude them from source ZIPs.
+/learning_data export-ignore
+/learning_data/** export-ignore
+/shorts export-ignore
+/shorts/** export-ignore
+/__pycache__ export-ignore
+/__pycache__/** export-ignore
+*.pyc export-ignore
+*.pyo export-ignore
+
+# Preserve the supplied LUT exactly, including line endings, on Windows checkouts.
+/assets/luts/*.cube binary

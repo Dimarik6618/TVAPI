@@ -31,6 +31,7 @@ from project_store import CacheStore, ProjectStore, fingerprint, digest, atomic_
 from hardware import Runtime
 from learning import LearningStore, EventSelector, EXCLUDED_REASONS
 from temporal_events import smart_bounds, diverse_order, cosine
+from scan_decode import decoder_args, error_tail, StreamWatchdog
 
 FPS_SAMPLE = 2
 WIDTH, HEIGHT = 160, 90
@@ -49,13 +50,17 @@ def ffmpeg_exe() -> str:
 
 
 def run_capture(args: list[str]) -> subprocess.CompletedProcess:
-    return tasks.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    try:
+        return tasks.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=30)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError('FFmpeg не прочитал параметры видео за 30 с. '
+                           'Проверьте файл и попробуйте локальную копию MP4.') from exc
 
 
 def video_info(path: Path, ffmpeg: str) -> tuple[float, bool]:
     if not Path(path).is_file():
         raise FileNotFoundError('Не найден исходный MP4: ' + str(path) + '. Подключите диск или выберите файл заново.')
-    probe = run_capture([ffmpeg, '-hide_banner', '-i', str(path)])
+    probe = run_capture([ffmpeg, '-hide_banner', '-nostdin', '-i', str(path)])
     info = probe.stderr.decode('utf-8', 'replace')
     match = re.search(r'Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)', info)
     if not match:
@@ -67,12 +72,21 @@ def video_info(path: Path, ffmpeg: str) -> tuple[float, bool]:
 
 
 def motion_samples(path: Path, ffmpeg: str, duration: float,
-                   on_progress=lambda fraction: None, threads: int = 4) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    args = [ffmpeg, '-v', 'error', '-threads', str(threads), '-i', str(path), '-vf',
+                   on_progress=lambda fraction: None, threads: int = 4,
+                   decode_args=()) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    args = [ffmpeg, '-v', 'error', '-nostdin', '-threads', str(threads), *decode_args, '-i', str(path), '-vf',
             f'fps={FPS_SAMPLE},scale={WIDTH}:{HEIGHT},format=gray',
-            '-an', '-f', 'rawvideo', '-pix_fmt', 'gray', '-']
-    proc = tasks.popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            '-an', '-sn', '-dn', '-f', 'rawvideo', '-pix_fmt', 'gray', '-']
+    # A full stderr pipe can stop FFmpeg while this thread waits for stdout.
+    # A temporary file cannot create that circular wait and is removed on close.
+    error_log = tempfile.TemporaryFile()
+    try:
+        proc = tasks.popen(args, stdout=subprocess.PIPE, stderr=error_log)
+    except BaseException:
+        error_log.close()
+        raise
     assert proc.stdout is not None
+    watchdog = StreamWatchdog(proc)
     frame_bytes = WIDTH * HEIGHT
     previous = None
     scores = []
@@ -84,6 +98,7 @@ def motion_samples(path: Path, ffmpeg: str, duration: float,
             frame = proc.stdout.read(frame_bytes)
             if len(frame) != frame_bytes:
                 break
+            watchdog.touch()
             current = np.frombuffer(frame, dtype=np.uint8).reshape(HEIGHT, WIDTH)
             # A blurred or nearly black frame carries less useful visual detail.
             sharpness = (np.abs(np.diff(current.astype(np.int16), axis=0)).mean()
@@ -102,17 +117,18 @@ def motion_samples(path: Path, ffmpeg: str, duration: float,
             if len(scores) % 12 == 0:
                 on_progress(min(1.0, len(scores) / max(1, duration * FPS_SAMPLE)))
         proc.stdout.close()
-        stderr = proc.stderr.read().decode('utf-8', 'replace') if proc.stderr else ''
         return_code = proc.wait()
         tasks.check()
+        watchdog.check()
         if return_code != 0:
-            raise RuntimeError('Ошибка чтения видеокадров: ' + stderr[-500:])
+            raise RuntimeError('Ошибка чтения видеокадров: ' + error_tail(error_log)[-500:])
     finally:
+        watchdog.close()
         if proc.poll() is None:
             proc.kill()
             proc.wait()
         if proc.stdout:proc.stdout.close()
-        if proc.stderr:proc.stderr.close()
+        error_log.close()
     if not scores:
         raise ValueError('Видео не содержит кадров.')
     on_progress(1.0)
@@ -123,10 +139,16 @@ def motion_samples(path: Path, ffmpeg: str, duration: float,
 
 def audio_samples(path: Path, ffmpeg: str, seconds: int,
                   on_progress=lambda fraction: None) -> np.ndarray:
-    args = [ffmpeg, '-v', 'error', '-i', str(path), '-vn', '-ac', '1',
+    args = [ffmpeg, '-v', 'error', '-nostdin', '-i', str(path), '-vn', '-sn', '-dn', '-ac', '1',
             '-ar', '8000', '-f', 's16le', '-']
-    proc = tasks.popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    error_log = tempfile.TemporaryFile()
+    try:
+        proc = tasks.popen(args, stdout=subprocess.PIPE, stderr=error_log)
+    except BaseException:
+        error_log.close()
+        raise
     assert proc.stdout is not None
+    watchdog = StreamWatchdog(proc)
     result = []
     try:
         while True:
@@ -134,23 +156,25 @@ def audio_samples(path: Path, ffmpeg: str, seconds: int,
             chunk = proc.stdout.read(8000 * 2)
             if not chunk:
                 break
+            watchdog.touch()
             samples = np.frombuffer(chunk[:len(chunk) // 2 * 2], dtype='<i2').astype(np.float32)
             if len(samples):
                 result.append(float(np.sqrt(np.mean(samples * samples))))
                 if len(result) % 10 == 0:
                     on_progress(min(1.0, len(result) / max(1, seconds)))
         proc.stdout.close()
-        stderr = proc.stderr.read().decode('utf-8', 'replace') if proc.stderr else ''
         return_code = proc.wait()
         tasks.check()
+        watchdog.check()
         if return_code != 0:
-            raise RuntimeError('Ошибка чтения аудио: ' + stderr[-500:])
+            raise RuntimeError('Ошибка чтения аудио: ' + error_tail(error_log)[-500:])
     finally:
+        watchdog.close()
         if proc.poll() is None:
             proc.kill()
             proc.wait()
         if proc.stdout:proc.stdout.close()
-        if proc.stderr:proc.stderr.close()
+        error_log.close()
     on_progress(1.0)
     return np.asarray(result[:seconds], dtype=np.float32)
 
@@ -309,27 +333,94 @@ def choose_clips(motion: np.ndarray, audio: np.ndarray, duration: float,
     return sorted(chosen, key=lambda item: item.start)
 
 
+def prepare_scan_scores(data):
+    """Derive ride-wide scales once per scan, retaining the original score formula.
+
+    Derived arrays live only in memory. A new scan (including a disk-cache hit)
+    prepares fresh scales; persisted caches and event timelines keep raw signals.
+    Treat returned scan arrays as immutable during an analysis pass.
+    """
+    size = max(1, math.ceil(len(data['motion']) / FPS_SAMPLE))
+    motion = np.asarray([np.mean(data['motion'][i*FPS_SAMPLE:(i+1)*FPS_SAMPLE])
+                         for i in range(size)])
+    sound = np.zeros(size)
+    sound[:min(size, len(data['audio']))] = data['audio'][:size]
+    activity = .3*normalize(motion) + .5*normalize(local_change(motion))
+    if len(data['audio']):
+        activity += .2*normalize(local_change(sound))
+    return {**data, '_score_timeline': {
+        'activity': activity,
+        'visual': normalize(data['motion']),
+        'audio': normalize(data['audio']),
+    }}
+
+
 def scan_video(path, ffmpeg, on_progress, proxy=None, cache=None, runtime=None):
+    runtime = runtime or Runtime.detect()
+    runtime.scan = {'stage':'cache','proxy':bool(proxy),'decoder':'not_started'}
+    on_progress(0.,'Проверка кэша')
     key = cache.key(path,proxy) if cache else None
     cached = cache.load_scan(key) if cache else None
     if cached:
+        runtime.scan.update(stage='complete',duration_seconds=cached[0],decoder='cache')
         on_progress(.95,'Сканирование из кэша')
-        return cached[0],cached[1],key
+        return cached[0],prepare_scan_scores(cached[1]),key
+    runtime.scan['stage'] = 'metadata'
+    on_progress(0.,'Чтение параметров MP4')
     duration, has_audio = video_info(path,ffmpeg)
-    runtime = runtime or Runtime.detect()
+    runtime.scan.update(duration_seconds=duration,source_bytes=Path(path).stat().st_size,
+                        stage='decoder_probe')
+    started = time.perf_counter()
+    try:
+        args, decoder, failures = decoder_args(ffmpeg,proxy or path,runtime.threads,
+            f'fps={FPS_SAMPLE},scale={WIDTH}:{HEIGHT},format=gray',WIDTH*HEIGHT,
+            lambda text:on_progress(.01,text))
+    finally:
+        runtime.scan['decoder_probe_seconds'] = round(time.perf_counter()-started,3)
+    runtime.scan.update(decoder=decoder,decoder_probe_errors=failures)
     stage = 'Сканирование LRF' if proxy else 'Сканирование движения'
-    motion,quality,signature = motion_samples(proxy or path,ffmpeg,duration,
-        lambda f:on_progress(.02+f*.70,stage), runtime.threads)
-    audio = (audio_samples(path,ffmpeg,math.ceil(duration),
-        lambda f:on_progress(.72+f*.23,'Анализ звука')) if has_audio else np.array([]))
+    runtime.scan['stage'] = 'motion'
+    def motion_progress(fraction):
+        runtime.scan['motion_progress'] = round(fraction,4)
+        on_progress(.02+fraction*.70,stage+' · '+runtime.scan['decoder'].upper())
+    on_progress(.02,stage+' · '+decoder.upper())
+    started = time.perf_counter()
+    try:
+        try:
+            motion,quality,signature = motion_samples(proxy or path,ffmpeg,duration,
+                motion_progress,runtime.threads,args)
+        except RuntimeError as exc:
+            if not args:
+                raise
+            tasks.check()
+            runtime.scan.update(decoder='cpu',decoder_fallback=str(exc))
+            on_progress(.02,'Декодирование GPU не удалось; повтор на CPU')
+            motion,quality,signature = motion_samples(proxy or path,ffmpeg,duration,
+                motion_progress,runtime.threads)
+    finally:
+        runtime.scan['motion_seconds'] = round(time.perf_counter()-started,3)
+    runtime.scan.update(frame_count=len(motion),stage='audio')
+    on_progress(.72,'Анализ звука')
+    started = time.perf_counter()
+    try:
+        def audio_progress(fraction):
+            runtime.scan['audio_progress'] = round(fraction,4)
+            on_progress(.72+fraction*.23,'Анализ звука')
+        audio = audio_samples(path,ffmpeg,math.ceil(duration),audio_progress) if has_audio else np.array([])
+    finally:
+        runtime.scan['audio_seconds'] = round(time.perf_counter()-started,3)
     tasks.check()
     data = dict(motion=motion,quality=quality,audio=audio,signature=signature)
     if cache:
         cache.save_scan(key,duration,**data)
-    return duration,data,key
+    runtime.scan['stage'] = 'complete'
+    return duration,prepare_scan_scores(data),key
 
 
 def describe_clip(clip, data):
+    scales = data.get('_score_timeline')
+    if scales is None:
+        scales = prepare_scan_scores(data)['_score_timeline']
     lo,hi=int(clip.start*FPS_SAMPLE),max(1,math.ceil(clip.end*FPS_SAMPLE))
     audio=data['audio'][int(clip.start):math.ceil(clip.end)]
     quality=data['quality'][lo:hi]
@@ -338,17 +429,15 @@ def describe_clip(clip, data):
     clip.signature=(np.mean(sig,axis=0).round(4).tolist() if len(sig) else [])
     clip.signals.update(baseline=clip.score,duration=min(2.,(clip.end-clip.start)/90.),
         quality=float(np.clip(np.mean(quality)/30.,0,1)) if len(quality) else 0.,
-        visual=float(np.mean(normalize(data['motion'])[lo:hi])) if len(motion) else 0.,
-        audio=float(np.mean(normalize(data['audio'])[int(clip.start):math.ceil(clip.end)])) if len(audio) else 0.)
+        visual=float(np.mean(scales['visual'][lo:hi])) if len(motion) else 0.,
+        audio=float(np.mean(scales['audio'][int(clip.start):math.ceil(clip.end)])) if len(audio) else 0.)
 
 
 def baseline_at(data, start, end):
-    size=max(1,math.ceil(len(data['motion'])/FPS_SAMPLE))
-    motion=np.asarray([np.mean(data['motion'][i*FPS_SAMPLE:(i+1)*FPS_SAMPLE]) for i in range(size)])
-    sound=np.zeros(size)
-    sound[:min(size,len(data['audio']))]=data['audio'][:size]
-    activity=.3*normalize(motion)+.5*normalize(local_change(motion))
-    if len(data['audio']):activity+=.2*normalize(local_change(sound))
+    scales = data.get('_score_timeline')
+    if scales is None:
+        scales = prepare_scan_scores(data)['_score_timeline']
+    activity = scales['activity']
     segment=activity[int(start):max(int(start)+1,math.ceil(end))]
     return round(.65*float(np.mean(segment))+.35*float(np.max(segment)),3)
 
@@ -435,8 +524,10 @@ def analyze_batch(paths: list[Path], clip_length: int, count: int,
                   deduplicate: bool = True, profile: str = 'auto',
                   resume: dict | None = None, on_complete=lambda path, clips: None,
                   model_pool: dict | None = None, learning_folder: Path | None = None,
-                  source_loader=None, source_origin=None, after_complete=None, capture_memory=False):
+                  source_loader=None, source_origin=None, after_complete=None, capture_memory=False,
+                  memory_features=True):
     rows,errors,diagnostics=[],[],[]
+    performance_records = []
     options=options or Options()
     preferences=PreferenceStore(preferences_folder) if preferences_folder else None
     model=preferences.fitted() if preferences else None
@@ -450,6 +541,17 @@ def analyze_batch(paths: list[Path], clip_length: int, count: int,
     if capture_memory and learning_folder:
         from event_archive import EventArchive
         archive = EventArchive(learning_folder)
+
+    def memory_complete(path):
+        if not capture_memory:
+            return True
+        if not archive:
+            return False
+        if memory_features:
+            return archive.can_release(path)
+        saved = archive.source_for(path)
+        return bool(saved and saved.get('complete'))
+
     if learning_folder:
         try:
             learning=LearningStore(learning_folder)
@@ -468,35 +570,49 @@ def analyze_batch(paths: list[Path], clip_length: int, count: int,
             if paths:errors.append((paths[0],f'Обученная модель: {exc}; используется обычный отбор.'))
     on_progress(0.,runtime.summary())
     for index,path in enumerate(paths):
+        runtime.scan = {}
         label=f'{index+1}/{len(paths)} · {path.name}'
+        file_started = time.perf_counter()
+        stage_seconds = {}
+        file_status, duration, clips = 'error', None, []
+
+        def timed(stage, operation, *args, **kwargs):
+            started = time.perf_counter()
+            try:
+                return operation(*args, **kwargs)
+            finally:
+                stage_seconds[stage] = stage_seconds.get(stage, 0.) + time.perf_counter()-started
+
         try:
             tasks.check()
             entry=(resume or {}).get(str(path.resolve()))
             if entry and entry.get('event_model','off')==selection_token:
                 valid=ProjectStore.valid_completed({'completed':{str(path.resolve()):entry}},archive)
-                if valid and (not capture_memory or (archive and archive.can_release(path))):
+                if valid and memory_complete(path):
                     clips=[Clip(**item) for item in entry['clips']]
                     rows.extend((path,clip) for clip in clips)
                     on_progress((index+1)/len(paths),label+' · восстановлено из проекта и памяти')
                     tasks.check()
                     if after_complete:after_complete(path,clips)
+                    file_status = 'restored'
                     continue
             if source_loader:
-                source_loader(path, lambda f:on_progress(index/len(paths),label+f' · загрузка {f:.0%}'))
+                timed('source_prepare',source_loader,path,lambda f:on_progress(index/len(paths),label+f' · загрузка {f:.0%}'))
             if not path.is_file():
                 raise FileNotFoundError(f'Не найден MP4: {path}. Подключите диск или выберите файл заново.')
             entry=(resume or {}).get(str(path.resolve()))
             if (entry and entry.get('fingerprint')==fingerprint(path) and entry.get('event_model','off')==selection_token
-                and (not capture_memory or (archive and archive.can_release(path)))):
+                and memory_complete(path)):
                 clips=[Clip(**item) for item in entry['clips']]
                 rows.extend((path,clip) for clip in clips)
                 on_progress((index+1)/len(paths),label+' · восстановлено из проекта')
                 tasks.check()
                 if after_complete:after_complete(path,clips)
+                file_status = 'restored'
                 continue
             proxy,warning=paired_proxy(path,ffmpeg_exe()) if use_proxies else (None,None)
             if warning:errors.append((path,warning))
-            duration,data,key=scan_video(path,ffmpeg_exe(),lambda f,stage:on_progress(
+            duration,data,key=timed('scan',scan_video,path,ffmpeg_exe(),lambda f,stage:on_progress(
                 (index+f*.45)/len(paths),f'{label} · {stage}'),proxy,cache,runtime)
             # A wider candidate pool lets thresholds/diversity filter rather than fill quotas.
             clips=choose_clips(data['motion'],data['audio'],duration,clip_length,
@@ -509,7 +625,7 @@ def analyze_batch(paths: list[Path], clip_length: int, count: int,
                     if speech is None:
                         speech = SpeechAnalyzer(ffmpeg_exe(), learning_folder or preferences_folder or path.parent, runtime)
                         pool['speech'] = speech
-                    speech_segments = speech.recognize(path, duration, lambda f:on_progress(
+                    speech_segments = timed('speech',speech.recognize,path,duration,lambda f:on_progress(
                         (index+.45+.13*f)/len(paths),label+' · распознавание речи'))
                     for item in speech_candidates(speech_segments, duration):
                         a,b=item['start'],item['end']
@@ -521,7 +637,7 @@ def analyze_batch(paths: list[Path], clip_length: int, count: int,
                     errors.append((path,'Речь: '+str(exc)))
             if selector:
                 try:
-                    clips=selector.discover(path,duration,data,clips,clip_length,count,
+                    clips=timed('trained_discovery',selector.discover,path,duration,data,clips,clip_length,count,
                         lambda f:on_progress((index+.58+.15*f)/len(paths),label+' · поиск обученных событий'))
                 except Exception as exc:
                     errors.append((path,f'Обученный сюжет: {exc}; используется обычный отбор.'))
@@ -562,11 +678,11 @@ def analyze_batch(paths: list[Path], clip_length: int, count: int,
                             if not old_key.startswith(('trained-event:','memory-features:','speech')):pool.pop(old_key)
                         import gc
                         gc.collect()
-                        advanced=AdvancedAnalyzer(effective,ffmpeg_exe(),lambda message:on_progress(
+                        advanced=timed('model_initialization',AdvancedAnalyzer,effective,ffmpeg_exe(),lambda message:on_progress(
                             (index+.73)/len(paths),message),runtime=runtime)
                         pool[pool_key]=advanced
                     try:
-                        advanced.enrich(path,pending,lambda stage,f:on_progress(
+                        timed('objects_sound_meaning',advanced.enrich,path,pending,lambda stage,f:on_progress(
                             (index+.73+.14*f)/len(paths),stage),frame_source=proxy)
                         errors.extend((path,w) for w in advanced.warnings)
                         diagnostics.extend(advanced.diagnostics)
@@ -589,7 +705,7 @@ def analyze_batch(paths: list[Path], clip_length: int, count: int,
             if selector and clips:
                 original=[Clip(**asdict(clip)) for clip in clips]
                 try:
-                    selector.enrich(path,clips,lambda f:on_progress((index+.87+.05*f)/len(paths),
+                    timed('trained_scoring',selector.enrich,path,clips,lambda f:on_progress((index+.87+.05*f)/len(paths),
                                                                     label+' · оценка обученного сюжета'))
                 except Exception as exc:
                     clips=original
@@ -602,9 +718,16 @@ def analyze_batch(paths: list[Path], clip_length: int, count: int,
                     clip.reason+=' · ваш выбор'
             if capture_memory and learning_folder:
                 from event_memory import remember
-                warning = remember(path,duration,data,clips,learning_folder,runtime,pool,selector,
+                memory_fraction = 0.
+                def memory_progress(fraction):
+                    nonlocal memory_fraction
+                    memory_fraction = fraction
+                    on_progress((index+.92+.079*fraction)/len(paths),label+' · память событий')
+                def memory_status(text):
+                    on_progress((index+.92+.079*memory_fraction)/len(paths),label+' · '+text)
+                warning = timed('event_memory',remember,path,duration,data,clips,learning_folder,runtime,pool,selector,
                     source_origin(path) if source_origin else None,
-                    lambda f:on_progress((index+.92+.079*f)/len(paths),label+' · память событий'))
+                    memory_progress,freeze_features=memory_features,on_status=memory_status)
                 if warning:
                     errors.append((path,'Анализ сохранён, но признаки для обучения не готовы: '+warning))
             clips=select_best(clips,count,threshold,deduplicate,[c for _,c in rows])
@@ -614,9 +737,26 @@ def analyze_batch(paths: list[Path], clip_length: int, count: int,
             tasks.check()
             if after_complete:
                 after_complete(path,clips)
+            file_status = 'complete'
             on_progress((index+1)/len(paths),label+f' · найдено {len(clips)}')
-        except tasks.Cancelled:break
+        except tasks.Cancelled:
+            file_status = 'stopped'
+            break
         except Exception as exc:errors.append((path,str(exc)))
+        finally:
+            performance_records.append({
+                'source':path.name,'duration_seconds':duration or runtime.scan.get('duration_seconds'),'status':file_status,
+                'total_seconds':round(time.perf_counter()-file_started,3),
+                'stage_seconds':{k:round(v,3) for k,v in stage_seconds.items()},
+                'scan_details':dict(runtime.scan),
+                'candidates_returned':len(clips)})
+            if preferences_folder:
+                try:
+                    atomic_json(Path(preferences_folder)/'moto_performance.json',{
+                        'version':1,'profile':profile,'memory_features':memory_features,
+                        'options':asdict(options),'files':performance_records})
+                except (OSError,ValueError) as exc:
+                    errors.append((path,'Отчёт времени не сохранён: '+str(exc)))
     if diagnostics and preferences_folder:
         log_path=Path(preferences_folder)/'moto_analysis.log'
         try:
@@ -630,7 +770,8 @@ def analyze_batch(paths: list[Path], clip_length: int, count: int,
 
 
 def reanalyze_clip(source, clip, options, folder, use_proxies=True, profile='auto',
-                   on_progress=lambda f,s:None, model_pool=None, learning_folder=None):
+                   on_progress=lambda f,s:None, model_pool=None, learning_folder=None,
+                   memory_features=True):
     cache=CacheStore(folder);runtime=Runtime.detect(profile)
     proxy,_=paired_proxy(source,ffmpeg_exe()) if use_proxies else (None,None)
     duration,data,key=scan_video(source,ffmpeg_exe(),on_progress,proxy,cache,runtime)
@@ -682,7 +823,9 @@ def reanalyze_clip(source, clip, options, folder, use_proxies=True, profile='aut
     if learning_folder:
         from event_memory import remember
         warning=remember(source,duration,data,[clip],learning_folder,runtime,pool,selector,
-                         on_progress=lambda f:on_progress(f,'Сохранение признаков изменённого отрезка'))
+                         on_progress=lambda f:on_progress(f,'Память изменённого отрезка'),
+                         freeze_features=memory_features,
+                         on_status=lambda text:on_progress(0.,text))
         if warning:warnings.append('Память событий: '+warning)
     return clip,warnings
 
@@ -720,7 +863,7 @@ def export(path: Path, destination: Path, clips: list[Clip], framing: str,
     try:
         with tempfile.TemporaryDirectory(prefix='moto_grade_') as temp_folder:
             if color.mode == 'dlog':
-                shutil.copyfile(color.lut, Path(temp_folder) / 'grade.cube')
+                shutil.copyfile(color.lut_path(), Path(temp_folder) / 'grade.cube')
             for index, clip in enumerate(selected, 1):
                 tasks.check()
                 output = destination / f'{path.stem}_short_{index:02d}.mp4'
@@ -932,6 +1075,7 @@ class App:
         self.use_proxies = tk.BooleanVar(value=True)
         self.threshold = tk.DoubleVar(value=.22)
         self.deduplicate = tk.BooleanVar(value=True)
+        self.memory_features = tk.BooleanVar(value=True)
         self.performance = tk.StringVar(value='Авто')
         self.framing = tk.StringVar(value='full')
         self.color_mode = tk.StringVar(value='Без коррекции')
@@ -1260,7 +1404,8 @@ class App:
                 def work():
                     result,warnings=reanalyze_clip(source,draft,Options(**cfg.get('options',{})),folder,
                         cfg.get('use_proxies',True),cfg.get('profile','auto'),
-                        lambda f,s:self.events.put(('progress',(f,s))),self.model_pool,self.learning_folder)
+                        lambda f,s:self.events.put(('progress',(f,s))),self.model_pool,self.learning_folder,
+                        memory_features=cfg.get('memory_features',True))
                     return ('edited',(index,result,warnings,open_video))
                 self.background(work)
             else:
@@ -1456,7 +1601,11 @@ class App:
         tk.Checkbutton(frame,text='Убирать похожие фрагменты',variable=self.deduplicate,bg=self.CARD,fg=self.PALE,selectcolor='#173047').grid(row=11,column=0,columnspan=2,sticky='w')
         self.label(frame,'Производительность').grid(row=12,column=0,sticky='w',pady=8)
         ttk.Combobox(frame,textvariable=self.performance,values=['Авто','Экономный','Максимальная скорость'],state='readonly',width=22,style='Neon.TCombobox').grid(row=12,column=1,sticky='w')
-        self.label(frame,'Число фрагментов — максимум; слабые кандидаты пропускаются.').grid(row=13,column=0,columnspan=2,sticky='w',pady=6)
+        tk.Checkbutton(frame,text='Признаки для обучения без оригиналов (дольше)',
+                       variable=self.memory_features,bg=self.CARD,fg=self.PALE,
+                       selectcolor='#173047').grid(row=13,column=0,columnspan=2,sticky='w')
+        self.label(frame,'Без признаков сохраняются таймкоды и оценки; исходники нужны для обучения.').grid(row=14,column=0,columnspan=2,sticky='w')
+        self.label(frame,'Число фрагментов — максимум; слабые кандидаты пропускаются.').grid(row=15,column=0,columnspan=2,sticky='w',pady=6)
         def apply():
             try:
                 length = 0 if self.auto_length.get() else self.length.get()
@@ -1472,7 +1621,7 @@ class App:
             window.destroy()
             self.start_analyze(length, count, flags, use_proxies)
         self.button(frame, '✦ НАЧАТЬ АНАЛИЗ', apply, self.CYAN, True).grid(
-            row=14, column=0, columnspan=2, sticky='ew', pady=(18, 0))
+            row=16, column=0, columnspan=2, sticky='ew', pady=(18, 0))
 
     def profile_key(self):
         return {'Авто':'auto','Экономный':'economy','Максимальная скорость':'fast'}.get(self.performance.get(),'auto')
@@ -1520,6 +1669,7 @@ class App:
             length=cfg.get('length',0);self.auto_length.set(length==0);self.length.set(length or 30)
             self.count.set(cfg.get('count',5));self.use_proxies.set(cfg.get('use_proxies',True))
             self.threshold.set(cfg.get('threshold',.22));self.deduplicate.set(cfg.get('deduplicate',True))
+            self.memory_features.set(cfg.get('memory_features',True))
             self.performance.set({'auto':'Авто','economy':'Экономный','fast':'Максимальная скорость'}.get(cfg.get('profile'),'Авто'))
             for key,value in cfg.get('options',{}).items():self.ai_flags[key].set(value)
             self.sources=[Path(r['source']) for r in state.get('rows',[])]
@@ -1570,12 +1720,15 @@ class App:
         profile=self.profile_key()
         def work():
             runtime=Runtime.detect(profile)
+            details = []
             try:
                 import torch
+                from hardware import torch_details
                 runtime.select_torch(torch)
+                details = torch_details(torch)
             except ImportError:runtime.notes.append('Пакеты ИИ не установлены.')
             runtime.select_encoder(ffmpeg_exe())
-            return ('hardware',runtime.summary()+'\nGPU: '+runtime.gpu+'\n'+'\n'.join(runtime.notes))
+            return ('hardware',runtime.summary()+'\nGPU: '+runtime.gpu+'\n'+'\n'.join(details+runtime.notes))
         self.background(work)
 
     def resume_project(self):
@@ -1584,6 +1737,7 @@ class App:
         cfg=self.analysis_settings
         self.threshold.set(cfg.get('threshold',.22))
         self.deduplicate.set(cfg.get('deduplicate',True))
+        self.memory_features.set(cfg.get('memory_features',True))
         self.performance.set({'auto':'Авто','economy':'Экономный','fast':'Максимальная скорость'}.get(cfg.get('profile'),'Авто'))
         self.start_analyze(cfg['length'],cfg['count'],Options(**cfg['options']),cfg['use_proxies'],resume=True)
 
@@ -1593,7 +1747,8 @@ class App:
         folder=Path(self.folder.get());profile=self.profile_key()
         self.analysis_settings={'length':length,'count':count,'options':asdict(flags),
             'use_proxies':use_proxies,'threshold':self.threshold.get(),
-            'deduplicate':self.deduplicate.get(),'profile':profile}
+            'deduplicate':self.deduplicate.get(),'profile':profile,
+            'memory_features':self.memory_features.get()}
         try:
             token=LearningStore(self.learning_folder).token()
         except (OSError,ValueError,KeyError,TypeError):token='unavailable'
@@ -1635,7 +1790,8 @@ class App:
                 restored,complete,self.model_pool,self.learning_folder,
                 source_loader=self.drive_store.ensure,
                 source_origin=lambda p:self.drive_store.entry(p)['metadata'] if self.drive_store.entry(p) else None,
-                after_complete=lambda p,c:self.cleanup_drive_source(p),capture_memory=True)
+                after_complete=lambda p,c:self.cleanup_drive_source(p),capture_memory=True,
+                memory_features=cfg.get('memory_features',True))
             self.project_state=state
             return ('analysis',result)
         self.background(work)
@@ -1665,13 +1821,30 @@ class App:
                             style='Neon.TCombobox', width=24,
                             values=('Без коррекции', 'Ручная настройка', 'D-Log M + LUT'))
         mode.grid(row=3, column=1, sticky='w', pady=(12, 0))
-        self.button(frame, 'LUT .CUBE', lambda: self.pick_lut(window)).grid(
+        lut_label = self.label(frame, '')
+        lut_label.configure(wraplength=380, justify='left')
+        lut_label.grid(row=5, column=0, columnspan=2, sticky='w', pady=6)
+        def show_lut():
+            name = ('Свой LUT: ' + Path(self.color_lut.get()).name if self.color_lut.get()
+                    else 'Встроенный LUT DJI Osmo Action 5 Pro → Rec.709')
+            lut_label.configure(text=name)
+        def choose_lut():
+            self.pick_lut(window)
+            show_lut()
+        def use_builtin_lut():
+            self.color_lut.set('')
+            self.color_mode.set('D-Log M + LUT')
+            show_lut()
+        show_lut()
+        self.button(frame, 'ДРУГОЙ LUT', choose_lut).grid(
             row=3, column=2, pady=(12, 0))
+        self.button(frame, 'ВСТРОЕННЫЙ DJI', use_builtin_lut).grid(
+            row=5, column=2, pady=6)
         self.label(frame, 'LUT применяйте только к съёмке D-Log M.').grid(
             row=4, column=1, columnspan=2, sticky='w')
         for row, (title, variable) in enumerate((('Яркость', self.color_brightness),
                                                   ('Контраст', self.color_contrast),
-                                                  ('Насыщенность', self.color_saturation)), 5):
+                                                  ('Насыщенность', self.color_saturation)), 6):
             self.label(frame, title).grid(row=row, column=0, sticky='w')
             tk.Scale(frame, from_=-30, to=30, orient='horizontal', length=250,
                      variable=variable, bg=self.CARD, fg=self.CYAN,
@@ -1689,7 +1862,7 @@ class App:
             window.destroy()
             self.start_export(color)
         self.button(frame, '✂ СОЗДАТЬ ШОРТСЫ', apply, self.PINK, True).grid(
-            row=8, column=0, columnspan=3, sticky='ew', pady=(14, 0))
+            row=9, column=0, columnspan=3, sticky='ew', pady=(14, 0))
 
     def pick_output(self, parent):
         folder = filedialog.askdirectory(parent=parent)
@@ -1941,7 +2114,8 @@ def main():
     parser.add_argument('--count', type=int, default=5, help='Количество фрагментов 1–20')
     parser.add_argument('--framing', choices=['full', 'crop'], default='full')
     parser.add_argument('--color', choices=['none', 'manual', 'dlog'], default='none')
-    parser.add_argument('--lut', type=Path, help='DJI Osmo Action 5 Pro .cube для D-Log M')
+    parser.add_argument('--lut', type=Path,
+                        help='Свой .cube для --color dlog; по умолчанию встроенный LUT DJI Action 5 Pro')
     parser.add_argument('--brightness', type=int, default=0, help='−30…30')
     parser.add_argument('--contrast', type=int, default=0, help='−30…30')
     parser.add_argument('--saturation', type=int, default=0, help='−30…30')
