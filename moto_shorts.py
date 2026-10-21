@@ -31,6 +31,7 @@ from project_store import CacheStore, ProjectStore, fingerprint, digest, atomic_
 from hardware import Runtime
 from learning import LearningStore, EventSelector, EXCLUDED_REASONS
 from temporal_events import smart_bounds, diverse_order, cosine
+from scan_decode import decoder_args, error_tail, StreamWatchdog
 
 FPS_SAMPLE = 2
 WIDTH, HEIGHT = 160, 90
@@ -49,13 +50,17 @@ def ffmpeg_exe() -> str:
 
 
 def run_capture(args: list[str]) -> subprocess.CompletedProcess:
-    return tasks.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    try:
+        return tasks.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=30)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError('FFmpeg не прочитал параметры видео за 30 с. '
+                           'Проверьте файл и попробуйте локальную копию MP4.') from exc
 
 
 def video_info(path: Path, ffmpeg: str) -> tuple[float, bool]:
     if not Path(path).is_file():
         raise FileNotFoundError('Не найден исходный MP4: ' + str(path) + '. Подключите диск или выберите файл заново.')
-    probe = run_capture([ffmpeg, '-hide_banner', '-i', str(path)])
+    probe = run_capture([ffmpeg, '-hide_banner', '-nostdin', '-i', str(path)])
     info = probe.stderr.decode('utf-8', 'replace')
     match = re.search(r'Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)', info)
     if not match:
@@ -67,12 +72,21 @@ def video_info(path: Path, ffmpeg: str) -> tuple[float, bool]:
 
 
 def motion_samples(path: Path, ffmpeg: str, duration: float,
-                   on_progress=lambda fraction: None, threads: int = 4) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    args = [ffmpeg, '-v', 'error', '-threads', str(threads), '-i', str(path), '-vf',
+                   on_progress=lambda fraction: None, threads: int = 4,
+                   decode_args=()) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    args = [ffmpeg, '-v', 'error', '-nostdin', '-threads', str(threads), *decode_args, '-i', str(path), '-vf',
             f'fps={FPS_SAMPLE},scale={WIDTH}:{HEIGHT},format=gray',
-            '-an', '-f', 'rawvideo', '-pix_fmt', 'gray', '-']
-    proc = tasks.popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            '-an', '-sn', '-dn', '-f', 'rawvideo', '-pix_fmt', 'gray', '-']
+    # A full stderr pipe can stop FFmpeg while this thread waits for stdout.
+    # A temporary file cannot create that circular wait and is removed on close.
+    error_log = tempfile.TemporaryFile()
+    try:
+        proc = tasks.popen(args, stdout=subprocess.PIPE, stderr=error_log)
+    except BaseException:
+        error_log.close()
+        raise
     assert proc.stdout is not None
+    watchdog = StreamWatchdog(proc)
     frame_bytes = WIDTH * HEIGHT
     previous = None
     scores = []
@@ -84,6 +98,7 @@ def motion_samples(path: Path, ffmpeg: str, duration: float,
             frame = proc.stdout.read(frame_bytes)
             if len(frame) != frame_bytes:
                 break
+            watchdog.touch()
             current = np.frombuffer(frame, dtype=np.uint8).reshape(HEIGHT, WIDTH)
             # A blurred or nearly black frame carries less useful visual detail.
             sharpness = (np.abs(np.diff(current.astype(np.int16), axis=0)).mean()
@@ -102,17 +117,18 @@ def motion_samples(path: Path, ffmpeg: str, duration: float,
             if len(scores) % 12 == 0:
                 on_progress(min(1.0, len(scores) / max(1, duration * FPS_SAMPLE)))
         proc.stdout.close()
-        stderr = proc.stderr.read().decode('utf-8', 'replace') if proc.stderr else ''
         return_code = proc.wait()
         tasks.check()
+        watchdog.check()
         if return_code != 0:
-            raise RuntimeError('Ошибка чтения видеокадров: ' + stderr[-500:])
+            raise RuntimeError('Ошибка чтения видеокадров: ' + error_tail(error_log)[-500:])
     finally:
+        watchdog.close()
         if proc.poll() is None:
             proc.kill()
             proc.wait()
         if proc.stdout:proc.stdout.close()
-        if proc.stderr:proc.stderr.close()
+        error_log.close()
     if not scores:
         raise ValueError('Видео не содержит кадров.')
     on_progress(1.0)
@@ -123,10 +139,16 @@ def motion_samples(path: Path, ffmpeg: str, duration: float,
 
 def audio_samples(path: Path, ffmpeg: str, seconds: int,
                   on_progress=lambda fraction: None) -> np.ndarray:
-    args = [ffmpeg, '-v', 'error', '-i', str(path), '-vn', '-ac', '1',
+    args = [ffmpeg, '-v', 'error', '-nostdin', '-i', str(path), '-vn', '-sn', '-dn', '-ac', '1',
             '-ar', '8000', '-f', 's16le', '-']
-    proc = tasks.popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    error_log = tempfile.TemporaryFile()
+    try:
+        proc = tasks.popen(args, stdout=subprocess.PIPE, stderr=error_log)
+    except BaseException:
+        error_log.close()
+        raise
     assert proc.stdout is not None
+    watchdog = StreamWatchdog(proc)
     result = []
     try:
         while True:
@@ -134,23 +156,25 @@ def audio_samples(path: Path, ffmpeg: str, seconds: int,
             chunk = proc.stdout.read(8000 * 2)
             if not chunk:
                 break
+            watchdog.touch()
             samples = np.frombuffer(chunk[:len(chunk) // 2 * 2], dtype='<i2').astype(np.float32)
             if len(samples):
                 result.append(float(np.sqrt(np.mean(samples * samples))))
                 if len(result) % 10 == 0:
                     on_progress(min(1.0, len(result) / max(1, seconds)))
         proc.stdout.close()
-        stderr = proc.stderr.read().decode('utf-8', 'replace') if proc.stderr else ''
         return_code = proc.wait()
         tasks.check()
+        watchdog.check()
         if return_code != 0:
-            raise RuntimeError('Ошибка чтения аудио: ' + stderr[-500:])
+            raise RuntimeError('Ошибка чтения аудио: ' + error_tail(error_log)[-500:])
     finally:
+        watchdog.close()
         if proc.poll() is None:
             proc.kill()
             proc.wait()
         if proc.stdout:proc.stdout.close()
-        if proc.stderr:proc.stderr.close()
+        error_log.close()
     on_progress(1.0)
     return np.asarray(result[:seconds], dtype=np.float32)
 
@@ -332,22 +356,64 @@ def prepare_scan_scores(data):
 
 
 def scan_video(path, ffmpeg, on_progress, proxy=None, cache=None, runtime=None):
+    runtime = runtime or Runtime.detect()
+    runtime.scan = {'stage':'cache','proxy':bool(proxy),'decoder':'not_started'}
+    on_progress(0.,'Проверка кэша')
     key = cache.key(path,proxy) if cache else None
     cached = cache.load_scan(key) if cache else None
     if cached:
+        runtime.scan.update(stage='complete',duration_seconds=cached[0],decoder='cache')
         on_progress(.95,'Сканирование из кэша')
         return cached[0],prepare_scan_scores(cached[1]),key
+    runtime.scan['stage'] = 'metadata'
+    on_progress(0.,'Чтение параметров MP4')
     duration, has_audio = video_info(path,ffmpeg)
-    runtime = runtime or Runtime.detect()
+    runtime.scan.update(duration_seconds=duration,source_bytes=Path(path).stat().st_size,
+                        stage='decoder_probe')
+    started = time.perf_counter()
+    try:
+        args, decoder, failures = decoder_args(ffmpeg,proxy or path,runtime.threads,
+            f'fps={FPS_SAMPLE},scale={WIDTH}:{HEIGHT},format=gray',WIDTH*HEIGHT,
+            lambda text:on_progress(.01,text))
+    finally:
+        runtime.scan['decoder_probe_seconds'] = round(time.perf_counter()-started,3)
+    runtime.scan.update(decoder=decoder,decoder_probe_errors=failures)
     stage = 'Сканирование LRF' if proxy else 'Сканирование движения'
-    motion,quality,signature = motion_samples(proxy or path,ffmpeg,duration,
-        lambda f:on_progress(.02+f*.70,stage), runtime.threads)
-    audio = (audio_samples(path,ffmpeg,math.ceil(duration),
-        lambda f:on_progress(.72+f*.23,'Анализ звука')) if has_audio else np.array([]))
+    runtime.scan['stage'] = 'motion'
+    def motion_progress(fraction):
+        runtime.scan['motion_progress'] = round(fraction,4)
+        on_progress(.02+fraction*.70,stage+' · '+runtime.scan['decoder'].upper())
+    on_progress(.02,stage+' · '+decoder.upper())
+    started = time.perf_counter()
+    try:
+        try:
+            motion,quality,signature = motion_samples(proxy or path,ffmpeg,duration,
+                motion_progress,runtime.threads,args)
+        except RuntimeError as exc:
+            if not args:
+                raise
+            tasks.check()
+            runtime.scan.update(decoder='cpu',decoder_fallback=str(exc))
+            on_progress(.02,'Декодирование GPU не удалось; повтор на CPU')
+            motion,quality,signature = motion_samples(proxy or path,ffmpeg,duration,
+                motion_progress,runtime.threads)
+    finally:
+        runtime.scan['motion_seconds'] = round(time.perf_counter()-started,3)
+    runtime.scan.update(frame_count=len(motion),stage='audio')
+    on_progress(.72,'Анализ звука')
+    started = time.perf_counter()
+    try:
+        def audio_progress(fraction):
+            runtime.scan['audio_progress'] = round(fraction,4)
+            on_progress(.72+fraction*.23,'Анализ звука')
+        audio = audio_samples(path,ffmpeg,math.ceil(duration),audio_progress) if has_audio else np.array([])
+    finally:
+        runtime.scan['audio_seconds'] = round(time.perf_counter()-started,3)
     tasks.check()
     data = dict(motion=motion,quality=quality,audio=audio,signature=signature)
     if cache:
         cache.save_scan(key,duration,**data)
+    runtime.scan['stage'] = 'complete'
     return duration,prepare_scan_scores(data),key
 
 
@@ -504,6 +570,7 @@ def analyze_batch(paths: list[Path], clip_length: int, count: int,
             if paths:errors.append((paths[0],f'Обученная модель: {exc}; используется обычный отбор.'))
     on_progress(0.,runtime.summary())
     for index,path in enumerate(paths):
+        runtime.scan = {}
         label=f'{index+1}/{len(paths)} · {path.name}'
         file_started = time.perf_counter()
         stage_seconds = {}
@@ -678,9 +745,10 @@ def analyze_batch(paths: list[Path], clip_length: int, count: int,
         except Exception as exc:errors.append((path,str(exc)))
         finally:
             performance_records.append({
-                'source':path.name,'duration_seconds':duration,'status':file_status,
+                'source':path.name,'duration_seconds':duration or runtime.scan.get('duration_seconds'),'status':file_status,
                 'total_seconds':round(time.perf_counter()-file_started,3),
                 'stage_seconds':{k:round(v,3) for k,v in stage_seconds.items()},
+                'scan_details':dict(runtime.scan),
                 'candidates_returned':len(clips)})
             if preferences_folder:
                 try:

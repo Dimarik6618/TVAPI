@@ -61,6 +61,7 @@ class Runtime:
     encoder: str = 'libx264'
     notes: list[str] = field(default_factory=list)
     probed: bool = False
+    scan: dict = field(default_factory=dict)
 
     @classmethod
     def detect(cls, profile='auto'):
